@@ -1,0 +1,171 @@
+import time
+import subprocess
+import shlex
+import shutil
+import random
+import math
+import datetime
+
+from mininet.net import Mininet
+from mininet.node import Controller, RemoteController, IVSSwitch, UserSwitch, OVSSwitch
+from mininet.nodelib import LinuxBridge
+from mininet.cli import CLI
+from mininet.log import setLogLevel, info
+
+from testcase import TestCase
+
+class GeneralTest( TestCase ):
+    "A general test case which is based on customized topology build from adjacent matrix, and can randomly inject malicious rules"
+    def __init__( self, matrix=None):
+        "initialization"
+        super(GeneralTest, self).__init__( )
+        self.matrix = matrix
+        # validate the matrix
+        if self.matrix == None:
+            raise ValueError('parameter matrix cannot be none.')
+        matrix_len = len(matrix)
+        for row in matrix:
+            if matrix_len != len(row):
+                raise ValueError('parameter matrix is illegal.')
+            for val in row:
+                if val != 0 and val != 1:
+                    raise ValueError('parameter matrix is illegal.')
+        # initialization
+        self.net = Mininet(controller=lambda name: RemoteController( name, ip='127.0.0.1', port=6633 ), switch=UserSwitch)
+        self.net.addController('c0')
+        # add switches, hosts and links between host and switch
+        for i in range(1, len(self.matrix)+1):
+            h = self.net.addHost('h{}'.format(i), ip='10.{}.{}.1'.format(i/255, i%255))
+            s = self.net.addSwitch('s{}'.format(i), dpid=str(i), protocols='OpenFlow10')
+            self.net.addLink(h, s)
+        # add links between switches
+        for i in range(len(self.matrix)):
+            for j in range(len(self.matrix)):
+                if matrix[i][j] == 1:
+                    s1 = self.net.get('s{}'.format(i+1))
+                    s2 = self.net.get('s{}'.format(j+1))
+                    self.net.addLink(s1, s2)
+        
+    def post_start( self ):
+        "do what you want immediately after the start of the network, or the preparement of your test"
+        self.net.pingAll()
+        
+    def duration2( self ):
+        "the interval between the finish of post start action and the begin of the test"
+        return 10
+
+    def get_paths( self, matrix ):
+        length = len(matrix)
+        A = []
+        for row in matrix:
+            A.append(row[:])
+        next_hops = [[-1 for x in range(length)] for x in range(length)]
+        for i in range(length):
+            for j in range(length):
+                if matrix[i][j] == 1:
+                    next_hops[i][j] = j
+        for k in range(length):
+            for i in range(length):
+                for j in range(length):
+                    if i != j and ((A[i][j] == 0 and A[i][k] != 0  and A[k][j] != 0) or (A[i][k] != 0 and A[k][j] != 0 and A[i][k] + A[k][j] < A[i][j])):
+                        A[i][j] = A[i][k] + A[k][j]
+                        next_hops[i][j] = next_hops[i][k]
+        paths = [ [ [] for x in range(length) ] for x in range(length)]
+        for i in range(length):
+            for j in range(length):
+                if next_hops[i][j] != -1:
+                    hp = i
+                    while hp != j:
+                        paths[i][j].append(hp)
+                        hp = next_hops[hp][j]
+                    paths[i][j].append(j)
+        return paths
+
+    def inject_malicious_rules( self ):
+        "inject malicious rules"
+        percent = [0.1, 0.6]
+        # triple < inject point, next hop of inject point, destination > 
+        malicious_rule = set([])
+        paths = self.get_paths( self.matrix )
+        candidates = []
+        for i in range(len(self.matrix)):
+            for j in range(len(self.matrix)):
+                if len(paths[i][j]) >= 3:
+                    candidates.append(paths[i][j])
+        random.seed(datetime.datetime.now())
+        random.shuffle(candidates)
+        per = random.triangular(*percent)
+        num = math.ceil( len(self.matrix) * per )
+        num = 1 if num < 1 else int(num)
+        sel = candidates[:num]
+        for path in sel:
+            dst = path[-1:][0]
+            p = random.randint(1, len(path) - 2)
+            sw = path[p]
+            nxt = path[p+1]
+            malicious_rule.add( (sw, nxt, dst) )
+        # retrieving forwarding port of flow forwarded to "dst" on switch "p", or the port on "p" connected with switch "nxt"
+        inject_info = []
+        for triple in malicious_rule:
+            prefix1 = 's{}-eth'.format(triple[0]+1)
+            prefix2 = 's{}-eth'.format(triple[1]+1)
+            for link in self.net.links:
+                if str(link.intf1).startswith(prefix1) and str(link.intf2).startswith(prefix2):
+                    port = int( str(link.intf1)[len(prefix1):] )
+                    inject_info.append( (triple[0]+1, port, triple[2]) )
+                    break
+                elif str(link.intf1).startswith(prefix2) and str(link.intf2).startswith(prefix1):
+                    port = int( str(link.intf2)[len(prefix1):] )
+                    inject_info.append( (triple[0]+1, port, triple[2]) )
+                    break
+        # build malicious rules
+        inject_cmd = []
+        for triple in inject_info:
+            dpid, port, dst = triple
+            sw = self.net.get('s{}'.format( dpid ))
+            if str(self.net.switch).find('OVSSwitch') != -1:            
+                cmd = 'ovs-ofctl add-flow {} ip,nw_dst=10.{}.{}.1,priority=255,actions=output:{}'.format(sw.name, (dst+1)/255, (dst+1)%255, 2 if port == 1 else port -1 )
+                info('*** inject rule on switch {}, cmd="{}"\n'.format(dpid, cmd))
+            elif str(self.net.switch).find('UserSwitch') != -1:
+                cmd = 'dpctl unix:/tmp/{} flow-mod cmd=add,table=0,hard=300,prio=255 eth_type=0x800,ip_dst=10.{}.{}.1 apply:output={}'.format(
+                    sw.name, (dst+1)/255, (dst+1)%255, 2 if port == 1 else port -1 )
+                info('*** inject rule on switch {}, cmd="{}"\n'.format(dpid, cmd))
+            else:
+                raise ValueError('switch unrecognized! cannot inject malicious rules')
+            inject_cmd.append(cmd)
+        # inject malicious flows
+        for cmd in inject_cmd:
+            cmds = shlex.split(cmd)
+            subprocess.Popen(cmds)
+        info('*** malicious rule injected finished, current: {}\n'.format( datetime.datetime.now().strftime('%H:%M:%S.%f') ))
+        
+    def test( self ):
+        "do test here"
+        sport = 2000
+        dport_start = 3000
+        dport_end = 5000
+        count = 100000
+        delay = 50000
+        dports = '{}-{}'.format(dport_start, dport_end)
+        for src in self.net.hosts:
+            dsts = ''
+            for dst in self.net.hosts:
+                if src != dst:
+                    dsts += (' ' + dst.IP())
+            src.cmd('./sendpkt -i {}-eth0 -g {} -p {} -w {}us -c {} {} &'.format(src.name, sport, dports, delay, count, dsts));
+        info('*** traffic injected for every pair of hosts, last for {} seconds...\n'.format(count*delay/1000/1000) )
+
+        random.seed(datetime.datetime.now())
+        intval = random.randint(10, 50)
+        info('*** inject malicious flow rules after {} seconds...\n'.format(intval))
+        # time.sleep(intval)
+        self.inject_malicious_rules( )
+
+    def duration3( self ):
+        "the interval between finish of calling test and do clean task, or the test duration"
+        return 360
+    
+    def clean( self, exception = False ):
+        "do clean work, the network will shutdown immediately after this"
+        for host in self.net.hosts:
+            host.cmd('kill %./sendpkt')

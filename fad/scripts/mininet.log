@@ -1,0 +1,6 @@
+2015-10-28 09:22:10,55 root     INFO do post start task after 1 seconds, current: 09:22:10.055745
+2015-10-28 09:22:12,133 root     INFO do test task after 1 seconds, current: 09:22:12.132964
+2015-10-28 09:22:14,134 root     INFO send command to h1: ./sendpkt -i h1-eth0 -g 2000 -p 3000-6001 -w 10000us -c 1000000 10.0.0.2 &
+2015-10-28 09:22:14,135 root     INFO traffic injected, last for 10000 seconds...
+2015-10-28 09:22:49,211 root     INFO iperf between h1 and h2: ['37.6 Gbits/sec', '37.6 Gbits/sec']
+2015-10-28 09:23:04,266 root     INFO iperf between h1 and h2: ['39.7 Gbits/sec', '39.8 Gbits/sec']
